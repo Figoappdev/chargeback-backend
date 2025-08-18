@@ -9,6 +9,8 @@ const moment = require('moment');
 dotenv.config();
 const app = express();
 app.use(cors());
+const complaintRoutes = require('./routes/complaints');
+app.use('/api/complaints', complaintRoutes);
 app.use(express.json());
 
 const db = new sqlite3.Database(process.env.DATABASE_PATH || ':memory:');
