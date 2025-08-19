@@ -5,12 +5,11 @@ const bcrypt = require('bcryptjs');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const moment = require('moment');
+const jsforce = require('jsforce');
 
 dotenv.config();
 const app = express();
 app.use(cors());
-const complaintRoutes = require('./routes/complaints');
-app.use('/api/complaints', complaintRoutes);
 app.use(express.json());
 
 const db = new sqlite3.Database(process.env.DATABASE_PATH || ':memory:');
