@@ -255,6 +255,23 @@ app.put('/api/disputes/assign/:id', authenticateToken, (req, res) => {
   });
 });
 
+app.post('/api/disputes/sync', authenticateToken, async (req, res) => {
+  const { id } = req.body;
+  db.get('SELECT * FROM disputes WHERE id = ?', [id], async (err, dispute) => {
+    if (err || !dispute) return res.status(404).json({ error: 'Dispute not found' });
+    await syncToSalesforce(dispute);
+    res.json({ message: 'Sync triggered' });
+  });
+});
+
+app.get('/api/disputes/:id/salesforce-status', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  db.get('SELECT salesforce_id FROM disputes WHERE id = ?', [id], (err, row) => {
+    if (err || !row) return res.status(404).json({ error: 'Dispute not found' });
+    res.json({ status: row.salesforce_id ? 'Synced' : 'Not Synced' });
+  });
+});
+
 app.post('/api/notify', authenticateToken, (req, res) => {
   console.log('Notification sent:', req.body.message);
   res.json({ message: 'Notification sent' });
