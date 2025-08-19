@@ -48,6 +48,18 @@ db.serialize(() => {
     merchant TEXT
   )`);
 
+   db.run(`CREATE TABLE IF NOT EXISTS credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE,
+    salesforce_client_id TEXT,
+    salesforce_client_secret TEXT,
+    salesforce_username TEXT,
+    salesforce_password TEXT,
+    salesforce_security_token TEXT,
+    salesforce_instance_url TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  )`);
+
   db.get('SELECT COUNT(*) as count FROM users', (err, row) => {
     if (row.count === 0) {
       const hashedPassword = bcrypt.hashSync('pass123', 10);
@@ -66,6 +78,49 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
+};
+
+const getUserCredentials = (userId, callback) => {
+  db.get('SELECT * FROM credentials WHERE user_id = ?', [userId], callback);
+};
+
+const connectToSalesforce = async (credentials) => {
+  const conn = new jsforce.Connection({
+    loginUrl: credentials.salesforce_instance_url || 'https://login.salesforce.com'
+  });
+  try {
+    await conn.login(credentials.salesforce_username, credentials.salesforce_password + (credentials.salesforce_security_token || ''));
+    console.log(`Connected to Salesforce for user ${credentials.user_id}`);
+    return conn;
+  } catch (err) {
+    console.error(`Salesforce connection failed for user ${credentials.user_id}:`, err.message);
+    return null;
+  }
+};
+
+const syncToSalesforce = async (dispute, credentials) => {
+  if (!credentials) {
+    console.log('No credentials available for sync');
+    return;
+  }
+  const conn = await connectToSalesforce(credentials);
+  if (!conn) return;
+
+  try {
+    const result = await conn.sobject('Dispute__c').create({
+      Transaction_Id__c: dispute.transaction_id,
+      Reason_Code__c: dispute.reason_code,
+      Amount__c: dispute.amount,
+      Status__c: dispute.status,
+      Priority__c: dispute.priority,
+      Deadline__c: dispute.deadline,
+      Evidence__c: dispute.evidence
+    });
+    db.run('UPDATE disputes SET salesforce_id = ? WHERE id = ?', [result.id, dispute.id]);
+    console.log(`Dispute ${dispute.id} synced to Salesforce: ${result.id}`);
+  } catch (err) {
+    console.error(`Sync error for dispute ${dispute.id}:`, err.message);
+  }
 };
 
 app.post('/api/register', async (req, res) => {
@@ -417,6 +472,31 @@ app.get('/api/docs', authenticateToken, (req, res) => {
     }
   });
 });
+
+app.get('/api/settings/salesforce', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+  db.get('SELECT * FROM credentials WHERE user_id = ?', [req.user.id], (err, row) => {
+    if (err) return res.status(500).json({ error: 'Server error' });
+    res.json(row || {});
+  });
+});
+
+app.post('/api/settings/salesforce', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+  const { salesforce_client_id, salesforce_client_secret, salesforce_username, salesforce_password, salesforce_security_token, salesforce_instance_url } = req.body;
+  if (!salesforce_username || !salesforce_password || !salesforce_instance_url) {
+    return res.status(400).json({ error: 'Required fields missing' });
+  }
+  db.run(
+    'INSERT OR REPLACE INTO credentials (user_id, salesforce_client_id, salesforce_client_secret, salesforce_username, salesforce_password, salesforce_security_token, salesforce_instance_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [req.user.id, salesforce_client_id, salesforce_client_secret, salesforce_username, salesforce_password, salesforce_security_token, salesforce_instance_url],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Failed to save credentials' });
+      res.json({ message: 'Credentials saved' });
+    }
+  );
+});
+
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
