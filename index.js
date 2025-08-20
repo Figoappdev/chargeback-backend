@@ -12,6 +12,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use('/api/integrations', require('./routes/integrations'));
+app.use('/api/disputes', require('./routes/disputes'));
 
 const db = new sqlite3.Database(process.env.DATABASE_PATH || ':memory:');
 
