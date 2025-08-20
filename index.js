@@ -11,6 +11,7 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use('/api/integrations', require('./routes/integrations'));
 
 const db = new sqlite3.Database(process.env.DATABASE_PATH || ':memory:');
 
