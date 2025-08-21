@@ -6,67 +6,92 @@ const dotenv = require('dotenv');
 const cors = require('cors');
 const moment = require('moment');
 const jsforce = require('jsforce');
+const winston = require('winston'); // Added for logging
 
 dotenv.config();
 const app = express();
-app.use(cors());
+
+// Configure logging
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'error.log', level: 'error' }),
+    new winston.transports.File({ filename: 'combined.log' })
+  ]
+});
+
+app.use(cors({
+  origin: 'https://chargeback-frontend-5yifou940-figos-projects-ae179906.vercel.app', // Specific frontend origin
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true
+}));
 app.use(express.json());
+
+// API Routes
 app.use('/api/integrations', require('./routes/integrations'));
 app.use('/api/disputes', require('./routes/disputes'));
 app.use('/api', require('./routes/auth'));
-const db = new sqlite3.Database(process.env.DATABASE_PATH || ':memory:');
 
+const db = new sqlite3.Database(process.env.DATABASE_PATH || ':memory:');
 db.serialize(() => {
+  // Ensure all tables are created with proper constraints
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE,
-    password TEXT,
-    role TEXT,
-    business TEXT
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('bank', 'admin', 'manager', 'analyst', 'viewer')),
+    business TEXT NOT NULL
   )`);
   db.run(`CREATE TABLE IF NOT EXISTS disputes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_id TEXT,
-    reason_code TEXT,
-    amount REAL,
-    status TEXT,
+    transaction_id TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    amount REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('initiated', 'pending', 'resolved')),
     user_id INTEGER,
-    priority INTEGER,
+    priority INTEGER DEFAULT 0,
     deadline TEXT,
-    evidence TEXT
+    evidence TEXT,
+    salesforce_id TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
   )`);
   db.run(`CREATE TABLE IF NOT EXISTS fraud_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    field TEXT,
-    condition TEXT,
-    value TEXT,
-    action TEXT
+    field TEXT NOT NULL,
+    condition TEXT NOT NULL,
+    value TEXT NOT NULL,
+    action TEXT NOT NULL
   )`);
   db.run(`CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    transaction_id TEXT,
-    amount REAL,
-    date TEXT,
-    merchant TEXT
+    transaction_id TEXT NOT NULL,
+    amount REAL NOT NULL,
+    date TEXT NOT NULL,
+    merchant TEXT NOT NULL
   )`);
-
-   db.run(`CREATE TABLE IF NOT EXISTS credentials (
+  db.run(`CREATE TABLE IF NOT EXISTS credentials (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER UNIQUE,
+    user_id INTEGER UNIQUE NOT NULL,
     salesforce_client_id TEXT,
     salesforce_client_secret TEXT,
     salesforce_username TEXT,
     salesforce_password TEXT,
     salesforce_security_token TEXT,
     salesforce_instance_url TEXT,
-    FOREIGN KEY (user_id) REFERENCES users(id)
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`);
 
+  // Initialize default users
   db.get('SELECT COUNT(*) as count FROM users', (err, row) => {
+    if (err) logger.error('Database error during user count:', err);
     if (row.count === 0) {
       const hashedPassword = bcrypt.hashSync('pass123', 10);
-      db.run('INSERT INTO users (email, password, role, business) VALUES (?, ?, ?, ?)', ['demo@bank.com', hashedPassword, 'bank', 'Demo Bank']);
-      db.run('INSERT INTO users (email, password, role, business) VALUES (?, ?, ?, ?)', ['admin@bank.com', hashedPassword, 'admin', 'Demo Bank']);
+      db.run('INSERT INTO users (email, password, role, business) VALUES (?, ?, ?, ?)', ['demo@bank.com', hashedPassword, 'bank', 'Demo Bank'], (err) => logger.error('User insert error:', err));
+      db.run('INSERT INTO users (email, password, role, business) VALUES (?, ?, ?, ?)', ['admin@bank.com', hashedPassword, 'admin', 'Demo Bank'], (err) => logger.error('User insert error:', err));
     }
   });
 });
@@ -76,14 +101,20 @@ const authenticateToken = (req, res, next) => {
   const token = authHeader && authHeader.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) return res.status(401).json({ error: 'Invalid or expired token' });
+    if (err) {
+      logger.error('Token verification failed:', err);
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
     req.user = user;
     next();
   });
 };
 
 const getUserCredentials = (userId, callback) => {
-  db.get('SELECT * FROM credentials WHERE user_id = ?', [userId], callback);
+  db.get('SELECT * FROM credentials WHERE user_id = ?', [userId], (err, row) => {
+    if (err) logger.error('Credentials fetch error:', err);
+    callback(err, row);
+  });
 };
 
 const connectToSalesforce = async (credentials) => {
@@ -92,22 +123,21 @@ const connectToSalesforce = async (credentials) => {
   });
   try {
     await conn.login(credentials.salesforce_username, credentials.salesforce_password + (credentials.salesforce_security_token || ''));
-    console.log(`Connected to Salesforce for user ${credentials.user_id}`);
+    logger.info(`Connected to Salesforce for user ${credentials.user_id}`);
     return conn;
   } catch (err) {
-    console.error(`Salesforce connection failed for user ${credentials.user_id}:`, err.message);
+    logger.error(`Salesforce connection failed for user ${credentials.user_id}:`, err.message);
     return null;
   }
 };
 
 const syncToSalesforce = async (dispute, credentials) => {
   if (!credentials) {
-    console.log('No credentials available for sync');
+    logger.warn('No credentials available for sync');
     return;
   }
   const conn = await connectToSalesforce(credentials);
   if (!conn) return;
-
   try {
     const result = await conn.sobject('Dispute__c').create({
       Transaction_Id__c: dispute.transaction_id,
@@ -118,13 +148,14 @@ const syncToSalesforce = async (dispute, credentials) => {
       Deadline__c: dispute.deadline,
       Evidence__c: dispute.evidence
     });
-    db.run('UPDATE disputes SET salesforce_id = ? WHERE id = ?', [result.id, dispute.id]);
-    console.log(`Dispute ${dispute.id} synced to Salesforce: ${result.id}`);
+    db.run('UPDATE disputes SET salesforce_id = ? WHERE id = ?', [result.id, dispute.id], (err) => logger.error('Salesforce sync update error:', err));
+    logger.info(`Dispute ${dispute.id} synced to Salesforce: ${result.id}`);
   } catch (err) {
-    console.error(`Sync error for dispute ${dispute.id}:`, err.message);
+    logger.error(`Sync error for dispute ${dispute.id}:`, err.message);
   }
 };
 
+// API Routes Implementation
 app.post('/api/register', async (req, res) => {
   const { email, password, business, role = 'bank' } = req.body;
   if (!email || !password || !business) {
@@ -141,12 +172,14 @@ app.post('/api/register', async (req, res) => {
       [email, hashedPassword, role, business],
       function (err) {
         if (err) {
+          logger.error('User registration error:', err);
           return res.status(400).json({ error: 'Email already exists' });
         }
         res.status(201).json({ message: 'User registered successfully' });
       }
     );
   } catch (err) {
+    logger.error('Hashing error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -155,6 +188,7 @@ app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
     if (err || !user || !(await bcrypt.compare(password, user.password))) {
+      logger.warn('Login attempt failed for:', email);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1h' });
@@ -171,7 +205,10 @@ app.get('/api/users', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Admin access required' });
   }
   db.all('SELECT id, email, role, business FROM users', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('User fetch error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json(rows);
   });
 });
@@ -186,7 +223,10 @@ app.put('/api/users/:id', authenticateToken, async (req, res) => {
     return res.status(400).json({ error: 'Invalid role' });
   }
   db.run('UPDATE users SET role = ? WHERE id = ?', [role, req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('User update error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json({ message: 'User updated' });
   });
 });
@@ -196,7 +236,10 @@ app.delete('/api/users/:id', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Admin access required' });
   }
   db.run('DELETE FROM users WHERE id = ?', [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('User delete error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     if (this.changes === 0) return res.status(404).json({ error: 'User not found' });
     res.json({ message: 'User deleted' });
   });
@@ -213,12 +256,16 @@ app.post('/api/users/:id/reset-password', authenticateToken, async (req, res) =>
   try {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     db.run('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, req.params.id], function (err) {
-      if (err) return res.status(500).json({ error: 'Server error' });
+      if (err) {
+        logger.error('Password reset error:', err);
+        return res.status(500).json({ error: 'Server error' });
+      }
       if (this.changes === 0) return res.status(404).json({ error: 'User not found' });
-      console.log(`Email notification sent to ${db.get('SELECT email FROM users WHERE id = ?', [req.params.id]).email}: Password updated`);
+      logger.info(`Password reset for user ${req.params.id}`);
       res.json({ message: 'Password updated and notification triggered' });
     });
   } catch (err) {
+    logger.error('Hashing error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -260,7 +307,10 @@ app.get('/api/disputes', authenticateToken, (req, res) => {
     params.push(req.user.id);
   }
   db.all(query, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('Dispute fetch error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json(rows);
   });
 });
@@ -280,7 +330,10 @@ app.post('/api/disputes', authenticateToken, (req, res) => {
     'INSERT INTO disputes (transaction_id, reason_code, amount, status, user_id, priority, deadline) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [transaction_id, reason_code, amount, status, user_id, priority || 0, deadline],
     function (err) {
-      if (err) return res.status(500).json({ error: 'Server error' });
+      if (err) {
+        logger.error('Dispute creation error:', err);
+        return res.status(500).json({ error: 'Server error' });
+      }
       res.status(201).json({ id: this.lastID });
     }
   );
@@ -295,7 +348,10 @@ app.put('/api/disputes/:id', authenticateToken, (req, res) => {
     'UPDATE disputes SET status = ?, evidence = ?, priority = ? WHERE id = ?',
     [status, evidence, priority, req.params.id],
     function (err) {
-      if (err) return res.status(500).json({ error: 'Server error' });
+      if (err) {
+        logger.error('Dispute update error:', err);
+        return res.status(500).json({ error: 'Server error' });
+      }
       res.json({ message: 'Dispute updated' });
     }
   );
@@ -307,7 +363,10 @@ app.put('/api/disputes/assign/:id', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Insufficient permissions to assign disputes' });
   }
   db.run('UPDATE disputes SET user_id = ? WHERE id = ?', [user_id, req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('Dispute assignment error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json({ message: 'Dispute assigned' });
   });
 });
@@ -315,8 +374,11 @@ app.put('/api/disputes/assign/:id', authenticateToken, (req, res) => {
 app.post('/api/disputes/sync', authenticateToken, async (req, res) => {
   const { id } = req.body;
   db.get('SELECT * FROM disputes WHERE id = ?', [id], async (err, dispute) => {
-    if (err || !dispute) return res.status(404).json({ error: 'Dispute not found' });
-    await syncToSalesforce(dispute);
+    if (err || !dispute) {
+      logger.error('Dispute sync fetch error:', err);
+      return res.status(404).json({ error: 'Dispute not found' });
+    }
+    await syncToSalesforce(dispute, await new Promise((resolve) => getUserCredentials(req.user.id, (err, cred) => resolve(cred))));
     res.json({ message: 'Sync triggered' });
   });
 });
@@ -324,13 +386,16 @@ app.post('/api/disputes/sync', authenticateToken, async (req, res) => {
 app.get('/api/disputes/:id/salesforce-status', authenticateToken, (req, res) => {
   const { id } = req.params;
   db.get('SELECT salesforce_id FROM disputes WHERE id = ?', [id], (err, row) => {
-    if (err || !row) return res.status(404).json({ error: 'Dispute not found' });
+    if (err || !row) {
+      logger.error('Salesforce status fetch error:', err);
+      return res.status(404).json({ error: 'Dispute not found' });
+    }
     res.json({ status: row.salesforce_id ? 'Synced' : 'Not Synced' });
   });
 });
 
 app.post('/api/notify', authenticateToken, (req, res) => {
-  console.log('Notification sent:', req.body.message);
+  logger.info('Notification sent:', req.body.message);
   res.json({ message: 'Notification sent' });
 });
 
@@ -339,7 +404,10 @@ app.get('/api/fraud', authenticateToken, (req, res) => {
     return res.status(403).json({ error: 'Insufficient permissions to view fraud rules' });
   }
   db.all('SELECT * FROM fraud_rules', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('Fraud rules fetch error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json(rows);
   });
 });
@@ -356,7 +424,10 @@ app.post('/api/fraud', authenticateToken, (req, res) => {
     'INSERT INTO fraud_rules (field, condition, value, action) VALUES (?, ?, ?, ?)',
     [field, condition, value, action],
     function (err) {
-      if (err) return res.status(500).json({ error: 'Server error' });
+      if (err) {
+        logger.error('Fraud rule creation error:', err);
+        return res.status(500).json({ error: 'Server error' });
+      }
       res.status(201).json({ id: this.lastID });
     }
   );
@@ -387,7 +458,10 @@ app.get('/api/transactions', authenticateToken, (req, res) => {
     params.push(endDate);
   }
   db.all(query, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('Transaction fetch error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json(rows);
   });
 });
@@ -405,7 +479,10 @@ app.post('/api/transactions', authenticateToken, (req, res) => {
     'INSERT INTO transactions (transaction_id, amount, date, merchant) VALUES (?, ?, ?, ?)',
     [transaction_id, amount, date, merchant],
     function (err) {
-      if (err) return res.status(500).json({ error: 'Server error' });
+      if (err) {
+        logger.error('Transaction creation error:', err);
+        return res.status(500).json({ error: 'Server error' });
+      }
       res.status(201).json({ id: this.lastID });
     }
   );
@@ -443,7 +520,10 @@ app.get('/api/analytics', authenticateToken, (req, res) => {
   }
   query += ' GROUP BY reason_code';
   db.all(query, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('Analytics fetch error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json(rows);
   });
 });
@@ -470,7 +550,10 @@ app.get('/api/docs', authenticateToken, (req, res) => {
     paths: {
       '/api/register': { post: { summary: 'Register a new user' } },
       '/api/login': { post: { summary: 'User login' } },
-      '/api/disputes': { get: { summary: 'Get disputes' }, post: { summary: 'Create dispute' } }
+      '/api/disputes': { get: { summary: 'Get disputes' }, post: { summary: 'Create dispute' } },
+      '/api/users': { get: { summary: 'Get all users (admin only)' } },
+      '/api/users/{id}': { put: { summary: 'Update user role (admin only)' }, delete: { summary: 'Delete user (admin only)' } },
+      '/api/users/{id}/reset-password': { post: { summary: 'Reset user password (admin only)' } }
     }
   });
 });
@@ -478,7 +561,10 @@ app.get('/api/docs', authenticateToken, (req, res) => {
 app.get('/api/settings/salesforce', authenticateToken, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
   db.get('SELECT * FROM credentials WHERE user_id = ?', [req.user.id], (err, row) => {
-    if (err) return res.status(500).json({ error: 'Server error' });
+    if (err) {
+      logger.error('Salesforce settings fetch error:', err);
+      return res.status(500).json({ error: 'Server error' });
+    }
     res.json(row || {});
   });
 });
@@ -493,12 +579,14 @@ app.post('/api/settings/salesforce', authenticateToken, (req, res) => {
     'INSERT OR REPLACE INTO credentials (user_id, salesforce_client_id, salesforce_client_secret, salesforce_username, salesforce_password, salesforce_security_token, salesforce_instance_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
     [req.user.id, salesforce_client_id, salesforce_client_secret, salesforce_username, salesforce_password, salesforce_security_token, salesforce_instance_url],
     (err) => {
-      if (err) return res.status(500).json({ error: 'Failed to save credentials' });
+      if (err) {
+        logger.error('Salesforce credentials save error:', err);
+        return res.status(500).json({ error: 'Failed to save credentials' });
+      }
       res.json({ message: 'Credentials saved' });
     }
   );
 });
 
-
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => logger.info(`Server running on port ${PORT}`));
