@@ -12,8 +12,8 @@ const express = require('express');
       if (!user) return res.status(401).json({ error: 'Invalid email or password' });
       bcrypt.compare(password, user.password, (err, match) => {
         if (err || !match) return res.status(401).json({ error: 'Invalid email or password' });
-        const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '1h' });
-        res.json({ token });
+        const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        res.json({ token, role: user.role }); // Return role with token
       });
     });
   });
